@@ -2161,7 +2161,11 @@ static int f2fs_ioc_start_atomic_write(struct file *filp, bool truncate)
 		clear_inode_flag(fi->cow_inode, FI_INLINE_DATA);
 	} else {
 		/* Reuse the already created COW inode */
-		f2fs_do_truncate_blocks(fi->cow_inode, 0, true);
+		ret = f2fs_do_truncate_blocks(fi->cow_inode, 0, true);
+		if (ret) {
+			f2fs_up_write(&fi->i_gc_rwsem[WRITE]);
+			goto out;
+		}
 	}
 
 	f2fs_write_inode(inode, NULL);
@@ -3061,15 +3065,16 @@ int f2fs_transfer_project_quota(struct inode *inode, kprojid_t kprojid)
 	struct dquot *transfer_to[MAXQUOTAS] = {};
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct super_block *sb = sbi->sb;
-	int err = 0;
+	int err;
 
 	transfer_to[PRJQUOTA] = dqget(sb, make_kqid_projid(kprojid));
-	if (!IS_ERR(transfer_to[PRJQUOTA])) {
-		err = __dquot_transfer(inode, transfer_to);
-		if (err)
-			set_sbi_flag(sbi, SBI_QUOTA_NEED_REPAIR);
-		dqput(transfer_to[PRJQUOTA]);
-	}
+	if (IS_ERR(transfer_to[PRJQUOTA]))
+		return PTR_ERR(transfer_to[PRJQUOTA]);
+
+	err = __dquot_transfer(inode, transfer_to);
+	if (err)
+		set_sbi_flag(sbi, SBI_QUOTA_NEED_REPAIR);
+	dqput(transfer_to[PRJQUOTA]);
 	return err;
 }
 
@@ -4086,7 +4091,7 @@ static int f2fs_ioc_set_compress_option(struct file *filp, unsigned long arg)
 
 	F2FS_I(inode)->i_compress_algorithm = option.algorithm;
 	F2FS_I(inode)->i_log_cluster_size = option.log_cluster_size;
-	F2FS_I(inode)->i_cluster_size = 1 << option.log_cluster_size;
+	F2FS_I(inode)->i_cluster_size = BIT(option.log_cluster_size);
 	f2fs_mark_inode_dirty_sync(inode, true);
 
 	if (!f2fs_is_compress_backend_ready(inode))
@@ -4181,8 +4186,11 @@ static int f2fs_ioc_decompress_file(struct file *filp)
 		if (ret < 0)
 			break;
 
-		if (get_dirty_pages(inode) >= blk_per_seg)
-			filemap_fdatawrite(inode->i_mapping);
+		if (get_dirty_pages(inode) >= blk_per_seg) {
+			ret = filemap_fdatawrite(inode->i_mapping);
+			if (ret < 0)
+				break;
+		}
 
 		count -= len;
 		page_idx += len;
@@ -4252,8 +4260,11 @@ static int f2fs_ioc_compress_file(struct file *filp)
 		if (ret < 0)
 			break;
 
-		if (get_dirty_pages(inode) >= blk_per_seg)
-			filemap_fdatawrite(inode->i_mapping);
+		if (get_dirty_pages(inode) >= blk_per_seg) {
+			ret = filemap_fdatawrite(inode->i_mapping);
+			if (ret < 0)
+				break;
+		}
 
 		count -= len;
 		page_idx += len;
@@ -4394,7 +4405,7 @@ static ssize_t f2fs_file_read_iter(struct kiocb *iocb, struct iov_iter *iter)
 		return -EOPNOTSUPP;
 
 	if (trace_f2fs_dataread_start_enabled()) {
-		char *p = f2fs_kmalloc(F2FS_I_SB(inode), PATH_MAX, GFP_KERNEL);
+		char *p = f2fs_getname(F2FS_I_SB(inode));
 		char *path;
 
 		if (!p)
@@ -4402,14 +4413,14 @@ static ssize_t f2fs_file_read_iter(struct kiocb *iocb, struct iov_iter *iter)
 
 		path = dentry_path_raw(file_dentry(iocb->ki_filp), p, PATH_MAX);
 		if (IS_ERR(path)) {
-			kfree(p);
+			f2fs_putname(p);
 			goto skip_read_trace;
 		}
 
 		trace_f2fs_dataread_start(inode, iocb->ki_pos,
 					iov_iter_count(iter),
 					current->pid, path, current->comm);
-		kfree(p);
+		f2fs_putname(p);
 	}
 skip_read_trace:
 	ret = generic_file_read_iter(iocb, iter);
@@ -4559,8 +4570,7 @@ static ssize_t f2fs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		ret = preallocated;
 	} else {
 		if (trace_f2fs_datawrite_start_enabled()) {
-			char *p = f2fs_kmalloc(F2FS_I_SB(inode),
-						PATH_MAX, GFP_KERNEL);
+			char *p = f2fs_getname(F2FS_I_SB(inode));
 			char *path;
 
 			if (!p)
@@ -4568,12 +4578,12 @@ static ssize_t f2fs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			path = dentry_path_raw(file_dentry(iocb->ki_filp),
 								p, PATH_MAX);
 			if (IS_ERR(path)) {
-				kfree(p);
+				f2fs_putname(p);
 				goto skip_write_trace;
 			}
 			trace_f2fs_datawrite_start(inode, orig_pos, orig_count,
 					current->pid, path, current->comm);
-			kfree(p);
+			f2fs_putname(p);
 		}
 skip_write_trace:
 		ret = __generic_file_write_iter(iocb, from);
