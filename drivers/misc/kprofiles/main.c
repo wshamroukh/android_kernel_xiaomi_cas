@@ -33,6 +33,7 @@
 #elif defined(CONFIG_AUTO_KPROFILES_FB)
 #include <linux/fb.h>
 #endif
+#include <linux/notifier.h>
 #include "version.h"
 
 #ifdef CONFIG_AUTO_KPROFILES_MSM_DRM
@@ -52,6 +53,10 @@
 #define kprofiles_events fb_event
 #endif
 
+static BLOCKING_NOTIFIER_HEAD(kp_mode_notifier);
+unsigned int KP_MODE_CHANGE = 0x80000000;
+EXPORT_SYMBOL(KP_MODE_CHANGE);
+
 static unsigned int kp_override_mode;
 static bool kp_override;
 #ifdef CONFIG_AUTO_KPROFILES
@@ -68,6 +73,19 @@ static struct kobject *kprofiles_kobj;
 
 DEFINE_MUTEX(kp_set_mode_rb_lock);
 DEFINE_SPINLOCK(kp_set_mode_lock);
+
+/**
+ * kp_trigger_mode_change_event - Trigger a mode change event
+ *
+ * This function triggers a mode change event by calling the blocking notifier
+ * chain for kp_mode_notifier. It informs all registered listeners about the
+ * change in the profile mode.
+ */
+static void kp_trigger_mode_change_event(void)
+{
+    unsigned int current_mode = kp_active_mode();
+    blocking_notifier_call_chain(&kp_mode_notifier, KP_MODE_CHANGE, (void *)current_mode);
+}
 
 /**
  * kp_set_mode_rollback - Change profile to a given mode for a specific duration
@@ -99,8 +117,10 @@ void kp_set_mode_rollback(unsigned int level, unsigned int duration_ms)
 
 	kp_override_mode = level;
 	kp_override = true;
+	kp_trigger_mode_change_event();
 	msleep(duration_ms);
 	kp_override = false;
+	kp_trigger_mode_change_event();
 	mutex_unlock(&kp_set_mode_rb_lock);
 }
 EXPORT_SYMBOL(kp_set_mode_rollback);
@@ -132,6 +152,7 @@ void kp_set_mode(unsigned int level)
 	}
 
 	kp_mode = level;
+	kp_trigger_mode_change_event();
 	spin_unlock(&kp_set_mode_lock);
 }
 EXPORT_SYMBOL(kp_set_mode);
@@ -169,18 +190,48 @@ int kp_active_mode(void)
 	if (!screen_on && auto_kp)
 		return 1;
 #endif
-
 	if (kp_override)
 		return kp_override_mode;
 
 	if (unlikely(kp_mode > 3)) {
 		kp_mode = 0;
-		pr_info("Invalid value passed, falling back to level 0\n");
+		kp_trigger_mode_change_event();
+		pr_info("%s: Invalid value passed, falling back to level 0\n",
+			__func__);
 	}
-
 	return kp_mode;
 }
 EXPORT_SYMBOL(kp_active_mode);
+
+/**
+ * kp_notifier_register_client - Register a notifier client for profile mode changes
+ * @nb: The notifier block to register
+ *
+ * This function registers a notifier client to receive notifications about profile mode changes.
+ *
+ * Return:
+ * 0 on success, or an error code on failure.
+ */
+int kp_notifier_register_client(struct notifier_block *nb)
+{
+    return blocking_notifier_chain_register(&kp_mode_notifier, nb);
+}
+EXPORT_SYMBOL(kp_notifier_register_client);
+
+/**
+ * kp_notifier_unregister_client - Unregister a notifier client for profile mode changes
+ * @nb: The notifier block to unregister
+ *
+ * This function unregisters a previously registered notifier client for profile mode changes.
+ *
+ * Return:
+ * 0 on success, or an error code on failure.
+ */
+int kp_notifier_unregister_client(struct notifier_block *nb)
+{
+    return blocking_notifier_chain_unregister(&kp_mode_notifier, nb);
+}
+EXPORT_SYMBOL(kp_notifier_unregister_client);
 
 #ifdef CONFIG_AUTO_KPROFILES
 static inline int kp_notifier_callback(struct notifier_block *self,
@@ -199,11 +250,13 @@ static inline int kp_notifier_callback(struct notifier_block *self,
 			if (!screen_on)
 				break;
 			screen_on = false;
+			kp_trigger_mode_change_event();
 			break;
 		case KP_BLANK_UNBLANK:
 			if (screen_on)
 				break;
 			screen_on = true;
+			kp_trigger_mode_change_event();
 			break;
 		default:
 			break;
@@ -303,13 +356,12 @@ static int __init kp_init(void)
 		return ret;
 	}
 
-	return ret;
-
 	ret = kprofiles_register_notifier();
 	if (ret) {
 		pr_err("Failed to register notifier, err: %d\n", ret);
 		sysfs_remove_group(kprofiles_kobj, &kprofiles_attr_group);
 		kobject_put(kprofiles_kobj);
+		return ret;
 	}
 
 	pr_info("Kprofiles " KPROFILES_VERSION " loaded successfully. For further details, visit https://github.com/dakkshesh07/Kprofiles/blob/main/README.md\n");
