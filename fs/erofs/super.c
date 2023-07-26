@@ -8,7 +8,6 @@
 #include <linux/statfs.h>
 #include <linux/parser.h>
 #include <linux/seq_file.h>
-#include <linux/crc32c.h>
 #include <linux/exportfs.h>
 #include "xattr.h"
 
@@ -45,33 +44,6 @@ void _erofs_info(struct super_block *sb, const char *function,
 
 	pr_info("(device %s): %pV", sb->s_id, &vaf);
 	va_end(args);
-}
-
-static int erofs_superblock_csum_verify(struct super_block *sb, void *sbdata)
-{
-	size_t len = 1 << EROFS_SB(sb)->blkszbits;
-	struct erofs_super_block *dsb;
-	u32 expected_crc, crc;
-
-	if (len > EROFS_SUPER_OFFSET)
-		len -= EROFS_SUPER_OFFSET;
-
-	dsb = kmemdup(sbdata + EROFS_SUPER_OFFSET, len, GFP_KERNEL);
-	if (!dsb)
-		return -ENOMEM;
-
-	expected_crc = le32_to_cpu(dsb->checksum);
-	dsb->checksum = 0;
-	/* to allow for x86 boot sectors and other oddities. */
-	crc = crc32c(~0, dsb, len);
-	kfree(dsb);
-
-	if (crc != expected_crc) {
-		erofs_err(sb, "invalid checksum 0x%08x, 0x%08x expected",
-			  crc, expected_crc);
-		return -EBADMSG;
-	}
-	return 0;
 }
 
 static void erofs_inode_init_once(void *ptr)
@@ -115,15 +87,16 @@ static void erofs_destroy_inode(struct inode *inode)
 static bool check_layout_compatibility(struct super_block *sb,
 				       struct erofs_super_block *dsb)
 {
-	const unsigned int feature = le32_to_cpu(dsb->feature_incompat);
+	struct erofs_sb_info *sbi = EROFS_SB(sb);
 
-	EROFS_SB(sb)->feature_incompat = feature;
+	sbi->feature_compat = le32_to_cpu(dsb->feature_compat);
+	sbi->feature_incompat = le32_to_cpu(dsb->feature_incompat);
 
 	/* check if current kernel meets all mandatory requirements */
-	if (feature & (~EROFS_ALL_FEATURE_INCOMPAT)) {
+	if (sbi->feature_incompat & (~EROFS_ALL_FEATURE_INCOMPAT)) {
 		erofs_err(sb,
 			  "unidentified incompatible feature %x, please upgrade kernel version",
-			   feature & ~EROFS_ALL_FEATURE_INCOMPAT);
+			   sbi->feature_incompat & ~EROFS_ALL_FEATURE_INCOMPAT);
 		return false;
 	}
 	return true;
@@ -202,6 +175,9 @@ static int erofs_load_compr_cfgs(struct super_block *sb,
 			break;
 		case Z_EROFS_COMPRESSION_LZMA:
 			ret = z_erofs_load_lzma_config(sb, dsb, data, size);
+			break;
+		case Z_EROFS_COMPRESSION_DEFLATE:
+			ret = z_erofs_load_deflate_config(sb, dsb, data, size);
 			break;
 		default:
 			DBG_BUGON(1);
@@ -319,13 +295,6 @@ static int erofs_read_superblock(struct super_block *sb)
 		goto out;
 	}
 
-	sbi->feature_compat = le32_to_cpu(dsb->feature_compat);
-	if (erofs_sb_has_sb_chksum(sbi)) {
-		ret = erofs_superblock_csum_verify(sb, data);
-		if (ret)
-			goto out;
-	}
-
 	ret = -EINVAL;
 	if (!check_layout_compatibility(sb, dsb))
 		goto out;
@@ -342,6 +311,7 @@ static int erofs_read_superblock(struct super_block *sb)
 	sbi->xattr_blkaddr = le32_to_cpu(dsb->xattr_blkaddr);
 	sbi->xattr_prefix_start = le32_to_cpu(dsb->xattr_prefix_start);
 	sbi->xattr_prefix_count = dsb->xattr_prefix_count;
+	sbi->xattr_filter_reserved = dsb->xattr_filter_reserved;
 #endif
 	sbi->islotbits = ilog2(sizeof(struct erofs_inode_compact));
 	sbi->root_nid = le16_to_cpu(dsb->root_nid);
@@ -534,69 +504,6 @@ static int erofs_parse_options(struct super_block *sb, char *options)
 	}
 	return 0;
 }
-
-#ifdef CONFIG_EROFS_FS_ZIP
-static const struct address_space_operations managed_cache_aops;
-
-static int erofs_managed_cache_releasepage(struct page *page, gfp_t gfp_mask)
-{
-	int ret = 1;	/* 0 - busy */
-	struct address_space *const mapping = page->mapping;
-
-	DBG_BUGON(!PageLocked(page));
-	DBG_BUGON(mapping->a_ops != &managed_cache_aops);
-
-	if (PagePrivate(page))
-		ret = erofs_try_to_free_cached_page(page);
-
-	return ret;
-}
-
-/*
- * It will be called only on inode eviction. In case that there are still some
- * decompression requests in progress, wait with rescheduling for a bit here.
- * We could introduce an extra locking instead but it seems unnecessary.
- */
-static void erofs_managed_cache_invalidatepage(struct page *page,
-					       unsigned int offset,
-					       unsigned int length)
-{
-	const unsigned int stop = length + offset;
-
-	DBG_BUGON(!PageLocked(page));
-
-	/* Check for potential overflow in debug mode */
-	DBG_BUGON(stop > PAGE_SIZE || stop < length);
-
-	if (offset == 0 && stop == PAGE_SIZE)
-		while (!erofs_managed_cache_releasepage(page, GFP_NOFS))
-			cond_resched();
-}
-
-static const struct address_space_operations managed_cache_aops = {
-	.releasepage = erofs_managed_cache_releasepage,
-	.invalidatepage = erofs_managed_cache_invalidatepage,
-};
-
-static int erofs_init_managed_cache(struct super_block *sb)
-{
-	struct erofs_sb_info *const sbi = EROFS_SB(sb);
-	struct inode *const inode = new_inode(sb);
-
-	if (!inode)
-		return -ENOMEM;
-
-	set_nlink(inode, 1);
-	inode->i_size = OFFSET_MAX;
-
-	inode->i_mapping->a_ops = &managed_cache_aops;
-	mapping_set_gfp_mask(inode->i_mapping, GFP_NOFS);
-	sbi->managed_cache = inode;
-	return 0;
-}
-#else
-static int erofs_init_managed_cache(struct super_block *sb) { return 0; }
-#endif
 
 static struct inode *erofs_nfs_get_inode(struct super_block *sb,
 					 u64 ino, u32 generation)
@@ -824,10 +731,8 @@ static int __init erofs_module_init(void)
 					       sizeof(struct erofs_inode), 0,
 					       SLAB_RECLAIM_ACCOUNT,
 					       erofs_inode_init_once);
-	if (!erofs_inode_cachep) {
-		err = -ENOMEM;
-		goto icache_err;
-	}
+	if (!erofs_inode_cachep)
+		return -ENOMEM;
 
 	err = erofs_init_shrinker();
 	if (err)
@@ -836,6 +741,10 @@ static int __init erofs_module_init(void)
 	err = z_erofs_lzma_init();
 	if (err)
 		goto lzma_err;
+
+	err = z_erofs_deflate_init();
+	if (err)
+		goto deflate_err;
 
 	erofs_pcpubuf_init();
 	err = z_erofs_init_zip_subsystem();
@@ -857,12 +766,13 @@ fs_err:
 sysfs_err:
 	z_erofs_exit_zip_subsystem();
 zip_err:
+	z_erofs_deflate_exit();
+deflate_err:
 	z_erofs_lzma_exit();
 lzma_err:
 	erofs_exit_shrinker();
 shrinker_err:
 	kmem_cache_destroy(erofs_inode_cachep);
-icache_err:
 	return err;
 }
 
@@ -875,6 +785,7 @@ static void __exit erofs_module_exit(void)
 
 	erofs_exit_sysfs();
 	z_erofs_exit_zip_subsystem();
+	z_erofs_deflate_exit();
 	z_erofs_lzma_exit();
 	erofs_exit_shrinker();
 	kmem_cache_destroy(erofs_inode_cachep);
