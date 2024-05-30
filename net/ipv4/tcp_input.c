@@ -6399,6 +6399,8 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb)
 				mptcp_push_pending_frames(mptcp_meta_sk(sk));
 			}
 		}
+		if (sk->sk_shutdown & SEND_SHUTDOWN)
+			tcp_shutdown(sk, SEND_SHUTDOWN);
 		break;
 
 	case TCP_FIN_WAIT1: {
