@@ -7733,6 +7733,7 @@ static int fts_probe(struct spi_device *client)
 	tp_common_set_fp_state_ops(&fp_state_ops);
 #endif
 #endif
+#endif
 
 	spin_lock_init(&fts_int);
 
